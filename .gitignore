@@ -1,25 +1,51 @@
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
-# Binaries for programs and plugins
+# Binaries
 *.exe
 *.exe~
+gamelist
+gamelist-debug
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# Go test binary + coverage output
 *.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
+# Go workspace files
 go.work
 go.work.sum
 
-# env file
+# Environment / secrets
 .env
+
+# ---------------------------------------------------------------------------
+# NEVER commit these:
+#   configs/config.yaml holds your personal IGDB/Steam/Epic API credentials.
+#   The SQLite database also stores validated tokens.
+# A fresh clone auto-generates a default config.yaml on first run.
+# ---------------------------------------------------------------------------
+configs/config.yaml
+
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local Go build/module cache (created by the dev tooling)
+.gocache/
+
+# Build output
+build/
+dist/
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
