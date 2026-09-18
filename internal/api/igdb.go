@@ -17,6 +17,12 @@ const igdbBaseURL = "https://api.igdb.com/v4"
 // on fuzzy title search.
 const ExternalGameSourceSteam = 1
 
+// ExternalGameSourceGOG is the IGDB external_game_sources ID for GOG
+// (verified live: sources are 1=Steam, 5=GOG, 26=Epic Games Store).
+// GOG uids are the numeric GOG product IDs, so GOG games also get exact
+// IGDB matching.
+const ExternalGameSourceGOG = 5
+
 // IGDBClient talks to the IGDB API v4 with an auto-managed Twitch OAuth token.
 type IGDBClient struct {
 	client *api.Client

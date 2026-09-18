@@ -31,8 +31,8 @@ type DatabaseConfig struct {
 type StoreConfigs struct {
 	Steam     SteamConfig     `yaml:"steam"`
 	Epic      EpicConfig      `yaml:"epic"`
-	Gog       EnabledConfig   `yaml:"gog"`
-	Ubisoft   EnabledConfig   `yaml:"ubisoft"`
+	Gog       GOGConfig       `yaml:"gog"`
+	Ubisoft   UbisoftConfig   `yaml:"ubisoft"`
 	Xbox      EnabledConfig   `yaml:"xbox"`
 	Battlenet BattleNetConfig `yaml:"battlenet"`
 	Dlsite    EnabledConfig   `yaml:"dlsite"`
@@ -63,6 +63,22 @@ type BattleNetConfig struct {
 	Enabled      bool   `yaml:"enabled"`
 	ClientID     string `yaml:"clientId"`
 	ClientSecret string `yaml:"clientSecret"`
+}
+
+// GOGConfig holds optional GOG settings. The built-in Galaxy client works
+// out of the box; the two fields below are advanced overrides.
+type GOGConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	ClientID     string `yaml:"clientId"`
+	ClientSecret string `yaml:"clientSecret"`
+}
+
+// UbisoftConfig holds Ubisoft Connect settings. The library is read from the
+// locally installed client's cache (no credentials involved); dataPath only
+// needs overriding for non-standard client installs.
+type UbisoftConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	DataPath string `yaml:"dataPath"`
 }
 
 // LoadConfig loads configuration from a YAML file path.

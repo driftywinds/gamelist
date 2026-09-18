@@ -52,15 +52,39 @@ func (s *AuthService) persist(storeAPI api.StoreAPI) error {
 		return s.db.SaveStoreCredentials(models.StoreSteam, "", "", 0, string(meta))
 
 	case *api.EpicGamesAPI:
+		tok, err := st.Tokens()
+		if err != nil {
+			return err
+		}
 		meta, err := json.Marshal(map[string]string{
-			"client_id":     st.ClientID(),
-			"client_secret": st.ClientSecret(),
+			"account_id":   tok.AccountID,
+			"display_name": tok.DisplayName,
 		})
 		if err != nil {
 			return err
 		}
-		token, exp := st.Token()
-		return s.db.SaveStoreCredentials(models.StoreEpic, token, "", exp, string(meta))
+		return s.db.SaveStoreCredentials(models.StoreEpic, tok.AccessToken, tok.RefreshToken, tok.ExpiresAt.Unix(), string(meta))
+
+	case *api.GOGAPI:
+		tok := st.Snapshot()
+		meta, err := json.Marshal(map[string]string{
+			"username": tok.Username,
+		})
+		if err != nil {
+			return err
+		}
+		return s.db.SaveStoreCredentials(models.StoreGOG, tok.AccessToken, tok.RefreshToken, tok.ExpiresAt.Unix(), string(meta))
+
+	case *api.UbisoftAPI:
+		// Local integration: no credentials exist. Store a marker so `status`
+		// reflects that the client data was found and validated.
+		meta, err := json.Marshal(map[string]string{
+			"source": "local Ubisoft Connect cache",
+		})
+		if err != nil {
+			return err
+		}
+		return s.db.SaveStoreCredentials(models.StoreUbisoft, "", "", 0, string(meta))
 
 	case *api.BattleNetAPI:
 		meta, err := json.Marshal(map[string]string{

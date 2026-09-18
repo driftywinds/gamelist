@@ -270,6 +270,52 @@ func (db *DB) AddGameStoreLink(gameRowID int64, storeName, storeID string) error
 	return err
 }
 
+// PruneStoreLinks removes a store's ownership links that were NOT part of the
+// latest successful fetch (keep lists the store_ids to keep; an empty-string
+// entry keeps ownership-only links that carry no store id), then deletes
+// games that lost their last link. Only call this for stores whose fetch
+// succeeded - a failed fetch means unknown, not unowned.
+func (db *DB) PruneStoreLinks(storeName string, keep []string) error {
+	keepSet := make(map[string]bool, len(keep))
+	for _, id := range keep {
+		keepSet[id] = true
+	}
+
+	rows, err := db.Query(`SELECT id, store_id FROM game_stores WHERE store_name = ?`, storeName)
+	if err != nil {
+		return fmt.Errorf("list %s links: %w", storeName, err)
+	}
+	var stale []int64
+	for rows.Next() {
+		var id int64
+		var storeID string
+		if err := rows.Scan(&id, &storeID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan %s link: %w", storeName, err)
+		}
+		if !keepSet[storeID] {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate %s links: %w", storeName, err)
+	}
+	rows.Close()
+
+	for _, id := range stale {
+		if _, err := db.Exec(`DELETE FROM game_stores WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("delete stale %s link: %w", storeName, err)
+		}
+	}
+
+	// Games that lost their last ownership link are dead data.
+	if _, err := db.Exec(`DELETE FROM games WHERE id NOT IN (SELECT DISTINCT game_id FROM game_stores)`); err != nil {
+		return fmt.Errorf("delete orphaned games: %w", err)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Store credential helpers
 // ---------------------------------------------------------------------------

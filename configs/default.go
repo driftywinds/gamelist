@@ -36,11 +36,17 @@ database:
 # Status:
 #   steam     WORKING       needs a Web API key + your SteamID64; the Steam
 #                           profile's "Game details" privacy must be public
-#   epic      partial       credentials are validated; listing the library
-#                           needs Epic's end-user OAuth flow (not implemented)
+#   epic      WORKING       sign in with: gamelist config signin epic (device-
+#                           code login in your browser; unofficial launcher API)
+#   gog       WORKING       sign in with: gamelist config signin gog (browser
+#                           login + paste the redirect URL; Galaxy client is
+#                           built in)
+#   ubisoft   WORKING       reads the library from the locally installed
+#                           Ubisoft Connect client's cache - no password or
+#                           token needed; the client must stay installed
 #   battlenet partial       credentials are validated; Blizzard exposes no
 #                           unified library API
-#   gog / ubisoft / xbox / dlsite
+#   xbox / dlsite
 #             placeholders  these stores have no usable public library API
 # ---------------------------------------------------------------------------
 stores:
@@ -50,10 +56,23 @@ stores:
     steamId: ""    # your SteamID64, e.g. 76561198012345678
   epic:
     enabled: false
+    # The built-in device-login client works out of the box - the two keys
+    # below are OPTIONAL overrides for advanced use (another Epic auth client
+    # that has the device_code grant enabled).
     clientId: ""
     clientSecret: ""
   gog:
     enabled: false
+    # The built-in Galaxy client credentials work out of the box - the two
+    # keys below are OPTIONAL overrides for advanced use.
+    clientId: ""
+    clientSecret: ""
+  ubisoft:
+    enabled: false
+    # Leave dataPath empty to use the standard client location
+    # (%LocalAppData%\Ubisoft Game Launcher). Override only for non-standard
+    # installs.
+    dataPath: ""
   ubisoft:
     enabled: false
   xbox:

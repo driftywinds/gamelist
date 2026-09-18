@@ -95,9 +95,10 @@ type storeFetch struct {
 // FetchAndMergeGames pulls every store concurrently, records each store's
 // outcome in sync_log, and merges cross-store ownership into one entry per
 // normalized title. No IGDB calls, no persistence.
-// An error is returned only when ALL stores failed; partial failures are
-// logged. This is the first phase of a sync.
-func (s *GameService) FetchAndMergeGames(storeAPIs []api.StoreAPI) ([]models.Game, error) {
+// Returns the merged games plus the keys of stores whose fetch SUCCEEDED
+// (only those may be pruned later - a failed fetch means unknown, not
+// unowned). An error is returned only when ALL stores failed.
+func (s *GameService) FetchAndMergeGames(storeAPIs []api.StoreAPI) ([]models.Game, []string, error) {
 	results := make([]storeFetch, len(storeAPIs))
 	var wg sync.WaitGroup
 	for i, st := range storeAPIs {
@@ -127,11 +128,13 @@ func (s *GameService) FetchAndMergeGames(storeAPIs []api.StoreAPI) ([]models.Gam
 	// Merge into one entry per normalized title.
 	gameMap := make(map[string]*models.Game)
 	var failures []string
+	var fetchedStores []string
 	for _, r := range results {
 		if r.err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", r.name, r.err))
 			continue
 		}
+		fetchedStores = append(fetchedStores, r.key)
 		for _, g := range r.games {
 			key := normalizeTitle(g.Title)
 			if key == "" {
@@ -148,7 +151,7 @@ func (s *GameService) FetchAndMergeGames(storeAPIs []api.StoreAPI) ([]models.Gam
 	}
 
 	if len(failures) > 0 && len(failures) == len(storeAPIs) {
-		return nil, fmt.Errorf("all stores failed:\n  %s", strings.Join(failures, "\n  "))
+		return nil, nil, fmt.Errorf("all stores failed:\n  %s", strings.Join(failures, "\n  "))
 	}
 	for _, f := range failures {
 		log.Printf("store error: %s", f)
@@ -159,7 +162,7 @@ func (s *GameService) FetchAndMergeGames(storeAPIs []api.StoreAPI) ([]models.Gam
 		out = append(out, *g)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Title < out[j].Title })
-	return out, nil
+	return out, fetchedStores, nil
 }
 
 // IGDBMatchedTitles returns a map of normalized game titles that already
@@ -187,8 +190,11 @@ func (s *GameService) IGDBMatchedTitles() (map[string]int, error) {
 }
 
 // EnrichAndSave is the second phase of a sync: enrich games with IGDB
-// according to mode (reporting per-game progress) and persist everything.
-func (s *GameService) EnrichAndSave(games []models.Game, mode SyncMode, progress SyncProgress) ([]models.Game, error) {
+// according to mode (reporting per-game progress), persist everything, and
+// prune stale ownership links for the stores that were fetched. storeKeys
+// must list exactly the stores whose fetch succeeded; pass nil to skip
+// pruning entirely.
+func (s *GameService) EnrichAndSave(games []models.Game, mode SyncMode, progress SyncProgress, storeKeys []string) ([]models.Game, error) {
 	sort.Slice(games, func(i, j int) bool { return games[i].Title < games[j].Title })
 
 	// Titles already matched in earlier syncs (used by incomplete mode).
@@ -241,6 +247,32 @@ func (s *GameService) EnrichAndSave(games []models.Game, mode SyncMode, progress
 		out = append(out, *g)
 	}
 
+	// Prune ownership links for successfully-fetched stores: a link whose
+	// store_id is no longer in the fetched set is stale (e.g. a refund or a
+	// previously-bad match). Games that lost their last link are removed.
+	if s.db != nil {
+		for _, key := range storeKeys {
+			keep := make([]string, 0, len(out))
+			seen := make(map[string]bool, len(out))
+			for _, g := range out {
+				if id, ok := g.StoreIDs[key]; ok {
+					if !seen[id] {
+						keep = append(keep, id)
+						seen[id] = true
+					}
+					continue
+				}
+				if containsString(g.OwnedStores, key) && !seen[""] {
+					keep = append(keep, "") // ownership-only link
+					seen[""] = true
+				}
+			}
+			if err := s.db.PruneStoreLinks(key, keep); err != nil {
+				log.Printf("Warning: could not prune stale %s links: %v", key, err)
+			}
+		}
+	}
+
 	var nMatched, nUnmatched int
 	for _, g := range merged {
 		if g.ID > 0 {
@@ -265,11 +297,11 @@ func (s *GameService) report(progress SyncProgress, done, total int, title, resu
 // enrich everything (refresh mode) and save. The CLI uses the split phases
 // so it can ask the user how much to refresh first.
 func (s *GameService) FetchAndEnrichGames(storeAPIs []api.StoreAPI) ([]models.Game, error) {
-	games, err := s.FetchAndMergeGames(storeAPIs)
+	games, keys, err := s.FetchAndMergeGames(storeAPIs)
 	if err != nil {
 		return nil, err
 	}
-	return s.EnrichAndSave(games, SyncModeRefresh, nil)
+	return s.EnrichAndSave(games, SyncModeRefresh, nil, keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +320,18 @@ func (s *GameService) enrichViaIGDB(g *models.Game) {
 		id, err := s.igdb.FindGameByExternalID(api.ExternalGameSourceSteam, appID)
 		if err != nil {
 			log.Printf("IGDB external-id match for %q (appid %s): %v", g.Title, appID, err)
+		} else if id > 0 {
+			s.applyIGDBDetails(g, id)
+			return
+		}
+	}
+
+	// GOG: IGDB indexes GOG product ids (external_game_source 5), so exact
+	// matching works here too.
+	if gogID := g.StoreIDs[models.StoreGOG]; gogID != "" {
+		id, err := s.igdb.FindGameByExternalID(api.ExternalGameSourceGOG, gogID)
+		if err != nil {
+			log.Printf("IGDB external-id match for %q (gog id %s): %v", g.Title, gogID, err)
 		} else if id > 0 {
 			s.applyIGDBDetails(g, id)
 			return
@@ -518,8 +562,17 @@ func marshalList(list []string) (string, error) {
 	return string(b), nil
 }
 
-// normalizeTitle lowercases and collapses whitespace for cross-store matching.
+// normalizeTitle lowercases and collapses whitespace for cross-store
+// matching, and strips trademark symbols that Ubisoft-style names carry
+// ("Far Cry® 3" matches "Far Cry 3").
 func normalizeTitle(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '®', '™', '©':
+			return -1
+		}
+		return r
+	}, s)
 	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
 }
 

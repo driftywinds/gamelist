@@ -1,13 +1,10 @@
 package api
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
-	"time"
 
 	"gamelist/internal/models"
 	"gamelist/pkg/api"
@@ -125,73 +122,6 @@ func (s *SteamAPI) GetOwnedGames() ([]models.Game, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Epic Games Store (credentials validated; library listing needs user OAuth)
-// ---------------------------------------------------------------------------
-
-// EpicGamesAPI implements StoreAPI for the Epic Games Store.
-//
-// SignIn performs Epic's client-credentials token request (HTTP Basic auth +
-// form body), which validates the App credentials but does NOT grant access
-// to a user's library: listing owned games requires an end-user OAuth flow
-// (authorization-code or device-code) that is not implemented yet.
-type EpicGamesAPI struct {
-	clientID     string
-	clientSecret string
-	accessToken  string
-	expiresAt    int64
-}
-
-// NewEpicGamesAPI builds an Epic Games Store integration.
-func NewEpicGamesAPI(clientID, clientSecret string) *EpicGamesAPI {
-	return &EpicGamesAPI{clientID: clientID, clientSecret: clientSecret}
-}
-
-func (e *EpicGamesAPI) Key() string  { return models.StoreEpic }
-func (e *EpicGamesAPI) Name() string { return models.DisplayStoreName(models.StoreEpic) }
-
-// Token returns the cached client-credentials token and its unix expiry.
-func (e *EpicGamesAPI) Token() (string, int64) { return e.accessToken, e.expiresAt }
-func (e *EpicGamesAPI) ClientID() string       { return e.clientID }
-func (e *EpicGamesAPI) ClientSecret() string   { return e.clientSecret }
-
-// SignIn validates the App credentials with a live token request.
-func (e *EpicGamesAPI) SignIn() error {
-	if e.clientID == "" || e.clientSecret == "" {
-		return fmt.Errorf("epic: both clientId and clientSecret must be set in configs/config.yaml")
-	}
-	creds := base64.StdEncoding.EncodeToString([]byte(e.clientID + ":" + e.clientSecret))
-	c := api.NewClient("https://api.epicgames.dev", map[string]string{
-		"Authorization": "Basic " + creds,
-		"Content-Type":  "application/x-www-form-urlencoded", // OAuth token endpoints reject JSON bodies
-	})
-	data, _, err := c.Do("POST", "/epic/oauth/v1/token", strings.NewReader("grant_type=client_credentials"), nil)
-	if err != nil {
-		return fmt.Errorf("epic: token request failed: %w", err)
-	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		ErrorCode    string `json:"errorCode"`
-		ErrorMessage string `json:"errorMessage"`
-	}
-	if err := json.Unmarshal(data, &tok); err != nil {
-		return fmt.Errorf("epic: token response decode: %w", err)
-	}
-	if tok.AccessToken == "" {
-		return fmt.Errorf("epic: credentials rejected: %s %s", tok.ErrorCode, tok.ErrorMessage)
-	}
-	e.accessToken = tok.AccessToken
-	e.expiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	return nil
-}
-
-// GetOwnedGames is not implemented: client credentials cannot read a user's
-// library; a device-code user flow is required.
-func (e *EpicGamesAPI) GetOwnedGames() ([]models.Game, error) {
-	return nil, fmt.Errorf("%w: listing an Epic library needs an end-user OAuth token (device-code flow); client credentials alone cannot read it", ErrNotImplemented)
-}
-
-// ---------------------------------------------------------------------------
 // Battle.net (credentials validated; no unified library API exists)
 // ---------------------------------------------------------------------------
 
@@ -275,18 +205,6 @@ func (p *placeholderStore) SignIn() error {
 
 func (p *placeholderStore) GetOwnedGames() ([]models.Game, error) {
 	return nil, fmt.Errorf("%w: %s - %s", ErrNotImplemented, p.displayName, p.reason)
-}
-
-// NewGOGAPI returns a GOG integration placeholder.
-func NewGOGAPI() StoreAPI {
-	return &placeholderStore{models.StoreGOG, "GOG",
-		"GOG has no documented library API; the Galaxy client's embedded endpoints are unofficial and change without notice"}
-}
-
-// NewUbisoftAPI returns a Ubisoft Connect integration placeholder.
-func NewUbisoftAPI() StoreAPI {
-	return &placeholderStore{models.StoreUbisoft, "Ubisoft Connect",
-		"Ubisoft Connect has no public API; library access requires tokens from the closed desktop client"}
 }
 
 // NewXboxAPI returns an Xbox integration placeholder.

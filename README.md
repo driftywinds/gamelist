@@ -12,10 +12,10 @@ multiple stores. All data lives in a single SQLite file on your machine.
 | Store            | Status      | Notes                                                                                   |
 |------------------|-------------|-----------------------------------------------------------------------------------------|
 | Steam            | **Working** | Needs a [Web API key](https://steamcommunity.com/dev/apikey) + your SteamID64. Profile's "Game details" privacy must be **public**. |
-| Epic Games Store | Partial     | Credentials are validated live; listing a library requires Epic's **end-user** OAuth (device-code) flow — not implemented yet. |
+| Epic Games Store | **Working** | Browser device-code login via `gamelist config signin epic`; session auto-refreshes. Unofficial launcher APIs — same mechanism as Heroic/Legendary. |
 | Battle.net       | Partial     | Credentials validated live; Blizzard exposes per-game account data, **no unified library API**. |
-| GOG              | Placeholder | No documented library API; Galaxy's embedded endpoints are unofficial and change without notice. |
-| Ubisoft Connect  | Placeholder | No public API; tokens must come from the closed desktop client.                         |
+| GOG              | **Working** | Browser login + paste-the-redirect-URL (`gamelist config signin gog`); Galaxy client built in; GOG product IDs give exact IGDB matching. Unofficial account APIs — same mechanism as MiniGalaxy/gogdl. |
+| Ubisoft Connect  | **Working** | Reads the library from the locally installed **Ubisoft Connect client's** cache — no password or token needed. Verified against the live gateway: Ubisoft retired the legacy remote API, so local data is the supported path. |
 | Xbox             | Placeholder | Library data sits behind Xbox Live XSTS auth; no public user-library API.               |
 | DLsite           | Placeholder | No public purchase/library API; would require authenticated scraping.                   |
 
@@ -34,7 +34,8 @@ game-list-manager/
 │   ├── api/
 │   │   ├── igdb.go                IGDB client: search, external-ID match, details (rate-limited)
 │   │   ├── igdb_auth.go           Twitch OAuth token source (auto-fetch + refresh + caching)
-│   │   └── store_apis.go          StoreAPI interface + Steam / Epic / Battle.net / placeholders
+│   │   ├── epic.go                Epic device-code login + library (entitlements/assets/catalog)
+│   │   └── store_apis.go          StoreAPI interface + Steam / Battle.net / placeholders
 │   ├── database/
 │   │   └── sqlite.go              modernc.org/sqlite (pure Go), versioned migrations, CRUD
 │   ├── models/
@@ -107,10 +108,10 @@ short-lived OAuth token itself, so you never paste a bearer token.
 
    You should get JSON results from IGDB. That proves the whole auth + query path works.
 
-### 3. Configure a store (Steam is the working one)
+### 3. Configure stores
 
-The recommended way is the interactive flow — it prompts for values, validates
-them with a live API call, and only saves when they actually work:
+**Steam** — interactive flow: prompts for values, validates them with a live API
+call, and only saves when they actually work:
 
 ```powershell
 gamelist config signin steam
@@ -130,6 +131,52 @@ stores:
 - Get your SteamID64 from your profile URL or <https://steamid.io>.
 - In Steam privacy settings, set **Game details** to **public**, or Steam will return
   an empty library.
+
+**Epic Games Store** — no keys needed, browser login:
+
+```powershell
+gamelist config signin epic
+```
+
+This performs a device-code login: a browser window opens, you log in with your
+Epic account and approve the request, and the CLI stores the session in the
+local database. Sessions refresh automatically on later syncs; if Epic
+invalidates one (e.g. after a password change), run the command again.
+
+The library is read from Epic's modern library service — the same data the
+Epic Games Launcher's Library tab shows — so purchased and free-to-claim games
+all appear. Fab / Unreal Marketplace assets are deliberately excluded. Epic
+games are matched to IGDB by title (Epic app names are not IGDB IDs), so the
+usual fuzzy-match caveats apply to obscure titles. This integration uses
+Epic's unofficial launcher APIs — the same mechanism as Heroic, Legendary and Rare.
+
+**GOG** — no keys needed, browser login + one paste:
+
+```powershell
+gamelist config signin gog
+```
+
+A browser window opens on GOG's login page; after logging in you land on a
+`https://embed.gog.com/on_login_success?...&code=...` page — paste that URL
+(or just the code) back into the CLI. The Galaxy client credentials are built
+in, and GOG product IDs map directly to IGDB entries, so GOG games get exact
+IGDB matching (like Steam). Owned games come from the same account endpoint
+the GOG library page uses (`getFilteredProducts`, mediaType=1).
+
+**Ubisoft Connect** — no credentials needed, reads the local client:
+
+```powershell
+gamelist config signin ubisoft
+```
+
+Ubisoft retired their legacy remote APIs (verified: the gateway 404s every
+documented endpoint), so this integration reads the **locally installed Ubisoft
+Connect client's own cache** — the same approach Playnite uses. Requirements:
+the Ubisoft Connect client must be installed and signed in at least once (it
+stays the source of truth; the library refreshes from its cache on every
+sync). Fab-style caveats: DLC/ULC packs that Ubisoft marks launchable may
+appear, and app IDs without a cached product config are skipped with a log
+line. IGDB matching is title-based (no Ubisoft source exists in IGDB).
 
 ### 4. Build and run
 
@@ -161,6 +208,7 @@ gamelist [--config <path>] <command> [args]
   sync [store]      Fetch owned games (all stores or one), match IGDB, store locally
                     [--refresh | --incomplete] skip the interactive completion prompt
   list              Print all stored games as JSON (sorted by title)
+  multi [--json]    List games owned on MORE THAN ONE store (the cross-store view)
   search <title>    Search IGDB directly (tests your IGDB credentials)
   status            Show which stores are enabled and signed in
   config            Manage configuration without editing config.yaml
@@ -229,9 +277,10 @@ table.
 
 ## How it works
 
-1. **`config signin`** prompts for credentials, runs a live validation call
-   (Steam: `GetPlayerSummaries`; Epic/Battle.net: their OAuth token endpoints),
-   and saves them to `config.yaml` **and** the `store_credentials` table.
+1. **`config signin`** validates credentials and stores them: Steam runs a live
+   `GetPlayerSummaries` check; Epic runs the interactive device-code login (browser
+   consent, then an exchange-code hop to the launcher client) and stores the session;
+   Battle.net validates Blizzard OAuth client credentials.
 2. **`sync`** fans out `GetOwnedGames()` across all signed-in stores concurrently,
    logging each outcome to `sync_log`.
 3. Games are normalized (lowercase, whitespace-collapsed) and **merged across stores**,
@@ -328,11 +377,16 @@ No CGO, no runtime DLLs — the exe is fully portable across Windows x64 machine
 
 ## Known limitations / next steps
 
-- Epic: implement the device-code user flow to actually list a library.
-- GOG/Ubisoft/Xbox/DLsite: blocked on viable APIs (see status table); the interface is
+- Epic: owned-game matching to IGDB is title-based (Epic app names are not IGDB IDs);
+  manual rematch for mis-matched entries is a natural improvement.
+- Ubisoft: reads the local client's cache, so the library is as fresh as the last
+  time the Ubisoft Connect client ran; installable ULC packs may appear alongside
+  games (they are launchable per Ubisoft's own config), and app IDs without a cached
+  product config are skipped.
+- Xbox/DLsite: blocked on viable APIs (see status table); the interface is
   ready the day one exists.
-- Cross-store matching is exact-ID first, title-fallback; a manual rematch command is a
-  natural next step.
+- Cross-store matching is exact-ID first (Steam appids, GOG product IDs), title-fallback
+  (Epic, Ubisoft); a manual rematch command is a natural next step.
 
 ## License
 

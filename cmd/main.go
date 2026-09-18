@@ -64,6 +64,8 @@ func main() {
 		cmdSync(cfg, db, args[1:])
 	case "list":
 		cmdList(db)
+	case "multi":
+		cmdMulti(db, args[1:])
 	case "search":
 		cmdSearch(cfg, db, args[1:])
 	case "status":
@@ -130,7 +132,7 @@ func cmdSignIn(cfg *configs.Config, db *database.DB, args []string) {
 	}
 	storeName := args[0]
 
-	storeAPI := buildStoreAPIFromConfig(cfg, storeName)
+	storeAPI := buildStoreAPIFromConfig(cfg, db, storeName)
 	if storeAPI == nil {
 		log.Fatalf("Unknown or disabled store %q - configure it first with: gamelist config signin %s", storeName, storeName)
 	}
@@ -203,7 +205,7 @@ func cmdSync(cfg *configs.Config, db *database.DB, args []string) {
 
 	svc := services.NewGameService(db, cfg.Igdb.ClientID, cfg.Igdb.ClientSecret)
 	fmt.Printf("Syncing %d store(s)...\n", len(apis))
-	games, err := svc.FetchAndMergeGames(apis)
+	games, fetchedStores, err := svc.FetchAndMergeGames(apis)
 	if err != nil {
 		log.Fatalf("Sync failed: %v", err)
 	}
@@ -244,7 +246,7 @@ func cmdSync(cfg *configs.Config, db *database.DB, args []string) {
 		fmt.Printf("[%4d/%4d] %-45s %s\n", done, total, truncateForDisplay(title, 45), result)
 	}
 
-	final, err := svc.EnrichAndSave(games, mode, progress)
+	final, err := svc.EnrichAndSave(games, mode, progress, fetchedStores)
 	if err != nil {
 		log.Fatalf("Sync failed: %v", err)
 	}
@@ -265,7 +267,7 @@ func cmdSync(cfg *configs.Config, db *database.DB, args []string) {
 // store was signed in and validated before. Stores without a sign-in record
 // are signed in (validated) transparently here.
 func buildStoreAPIForSync(cfg *configs.Config, db *database.DB, auth *services.AuthService, key string) api.StoreAPI {
-	a := buildStoreAPIFromConfig(cfg, key)
+	a := buildStoreAPIFromConfig(cfg, db, key)
 	if a == nil {
 		return nil
 	}
@@ -315,6 +317,58 @@ func cmdList(db *database.DB) {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(games); err != nil {
 		log.Fatalf("Failed to encode games: %v", err)
+	}
+}
+
+// cmdMulti lists games owned on MORE THAN ONE store - the cross-store view.
+func cmdMulti(db *database.DB, args []string) {
+	asJSON := false
+	for _, a := range args {
+		switch a {
+		case "--json":
+			asJSON = true
+		default:
+			fmt.Printf("Unknown option %q (usage: multi [--json])\n", a)
+			os.Exit(1)
+		}
+	}
+
+	svc := services.NewGameService(db, "", "")
+	games, err := svc.ListGamesFromDB()
+	if err != nil {
+		log.Fatalf("Failed to list games: %v", err)
+	}
+
+	multi := make([]models.Game, 0)
+	for _, g := range games {
+		if len(g.OwnedStores) > 1 {
+			multi = append(multi, g)
+		}
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(multi); err != nil {
+			log.Fatalf("Failed to encode games: %v", err)
+		}
+		return
+	}
+
+	if len(multi) == 0 {
+		fmt.Println("No games are owned on multiple stores yet.")
+		fmt.Println("Ownership merges by game title - make sure every store you own")
+		fmt.Println("games on has been synced: gamelist sync")
+		return
+	}
+
+	fmt.Printf("%d game(s) owned on multiple stores:\n", len(multi))
+	for _, g := range multi {
+		names := make([]string, 0, len(g.OwnedStores))
+		for _, k := range g.OwnedStores {
+			names = append(names, models.DisplayStoreName(k))
+		}
+		fmt.Printf("  - %s  [%s]\n", g.Title, strings.Join(names, ", "))
 	}
 }
 
@@ -467,8 +521,11 @@ func cmdConfigSet(configPath string, cfg *configs.Config, args []string) {
 	}
 }
 
+// stdinReader is the single shared stdin reader so interactive flows never
+// fight over buffered input.
+var stdinReader = bufio.NewReader(os.Stdin)
+
 func cmdConfigSignin(configPath string, cfg *configs.Config, db *database.DB, store string) {
-	reader := bufio.NewReader(os.Stdin)
 	auth := services.NewAuthService(db)
 
 	switch store {
@@ -476,8 +533,8 @@ func cmdConfigSignin(configPath string, cfg *configs.Config, db *database.DB, st
 		fmt.Println("Steam sign-in")
 		fmt.Println("  Web API key: https://steamcommunity.com/dev/apikey")
 		fmt.Println("  SteamID64:   your profile URL or steamid.io")
-		key := promptValue(reader, "Steam Web API key", maskSecret(cfg.Stores.Steam.APIKey), cfg.Stores.Steam.APIKey)
-		id := promptValue(reader, "SteamID64", cfg.Stores.Steam.SteamID, cfg.Stores.Steam.SteamID)
+		key := promptValue(stdinReader, "Steam Web API key", maskSecret(cfg.Stores.Steam.APIKey), cfg.Stores.Steam.APIKey)
+		id := promptValue(stdinReader, "SteamID64", cfg.Stores.Steam.SteamID, cfg.Stores.Steam.SteamID)
 		if key == "" || id == "" {
 			fmt.Println("Both values are required.")
 			os.Exit(1)
@@ -501,37 +558,24 @@ func cmdConfigSignin(configPath string, cfg *configs.Config, db *database.DB, st
 		fmt.Println("Next: gamelist sync steam")
 
 	case models.StoreEpic:
-		fmt.Println("Epic Games Store sign-in")
-		fmt.Println("  App credentials: https://dev.epicgames.com/portal")
-		id := promptValue(reader, "Client ID", cfg.Stores.Epic.ClientID, cfg.Stores.Epic.ClientID)
-		secret := promptValue(reader, "Client Secret", maskSecret(cfg.Stores.Epic.ClientSecret), cfg.Stores.Epic.ClientSecret)
-		if id == "" || secret == "" {
-			fmt.Println("Both values are required.")
+		fmt.Println("Epic Games Store sign-in (device-code flow)")
+		fmt.Println("A browser window will open - log in with your Epic account and approve the request.")
+		apiC := api.NewEpicGamesAPI(cfg.Stores.Epic.ClientID, cfg.Stores.Epic.ClientSecret, epicHooks(db))
+		if err := auth.SignIn(apiC); err != nil {
+			log.Printf("Epic sign-in failed: %v", err)
 			os.Exit(1)
 		}
-		apiC := api.NewEpicGamesAPI(id, secret)
-		if err := apiC.SignIn(); err != nil {
-			log.Printf("Epic validation failed: %v", err)
-			fmt.Fprintln(os.Stderr, "Nothing was saved - fix the values and try again.")
-			os.Exit(1)
-		}
-		writeConfigUpdates(configPath, map[string]string{
-			"stores.epic.enabled":      "true",
-			"stores.epic.clientId":     id,
-			"stores.epic.clientSecret": secret,
-		})
-		if err := auth.Persist(apiC); err != nil {
-			log.Fatalf("%v", err)
-		}
-		fmt.Println("Signed in to Epic Games Store: App credentials validated and saved.")
-		fmt.Println("Note: listing your Epic library needs Epic's end-user OAuth (device-code) flow,")
-		fmt.Println("which is not implemented yet - sync will report it as not implemented.")
+		writeConfigUpdates(configPath, map[string]string{"stores.epic.enabled": "true"})
+		fmt.Println("Signed in to Epic Games Store: session validated and saved to the local database.")
+		fmt.Println("The session refreshes itself automatically on later syncs.")
+		fmt.Println("Note: this uses Epic's unofficial launcher APIs (same mechanism as Heroic/Legendary).")
+		fmt.Println("Next: gamelist sync epic")
 
 	case models.StoreBattleNet:
 		fmt.Println("Battle.net sign-in")
 		fmt.Println("  Client credentials: https://develop.battle.net/access/clients")
-		id := promptValue(reader, "Client ID", cfg.Stores.Battlenet.ClientID, cfg.Stores.Battlenet.ClientID)
-		secret := promptValue(reader, "Client Secret", maskSecret(cfg.Stores.Battlenet.ClientSecret), cfg.Stores.Battlenet.ClientSecret)
+		id := promptValue(stdinReader, "Client ID", cfg.Stores.Battlenet.ClientID, cfg.Stores.Battlenet.ClientID)
+		secret := promptValue(stdinReader, "Client Secret", maskSecret(cfg.Stores.Battlenet.ClientSecret), cfg.Stores.Battlenet.ClientSecret)
 		if id == "" || secret == "" {
 			fmt.Println("Both values are required.")
 			os.Exit(1)
@@ -553,13 +597,38 @@ func cmdConfigSignin(configPath string, cfg *configs.Config, db *database.DB, st
 		fmt.Println("Signed in to Battle.net: credentials validated and saved.")
 		fmt.Println("Note: Blizzard exposes no unified library API - sync will report it as not implemented.")
 
-	case models.StoreGOG, models.StoreUbisoft, models.StoreXbox, models.StoreDLsite:
+	case models.StoreGOG:
+		fmt.Println("GOG sign-in (browser login + redirect-URL paste)")
+		fmt.Println("The Galaxy client credentials are built in - nothing to configure.")
+		apiC := api.NewGOGAPI(cfg.Stores.Gog.ClientID, cfg.Stores.Gog.ClientSecret, gogHooks(db))
+		if err := auth.SignIn(apiC); err != nil {
+			log.Printf("GOG sign-in failed: %v", err)
+			os.Exit(1)
+		}
+		writeConfigUpdates(configPath, map[string]string{"stores.gog.enabled": "true"})
+		fmt.Println("Signed in to GOG: session validated and saved to the local database.")
+		fmt.Println("The session refreshes itself automatically on later syncs.")
+		fmt.Println("Note: this uses GOG's unofficial account APIs (same mechanism as Heroic/Legendary/MiniGalaxy).")
+		fmt.Println("Next: gamelist sync gog")
+
+	case models.StoreUbisoft:
+		fmt.Println("Ubisoft Connect sign-in (local client integration)")
+		fmt.Println("Your library is read from the locally installed Ubisoft Connect client's")
+		fmt.Println("own cache - no password or token is needed here.")
+		apiC := api.NewUbisoftAPI(cfg.Stores.Ubisoft.DataPath)
+		if err := auth.SignIn(apiC); err != nil {
+			log.Printf("Ubisoft sign-in failed: %v", err)
+			os.Exit(1)
+		}
+		writeConfigUpdates(configPath, map[string]string{"stores.ubisoft.enabled": "true"})
+		fmt.Println("Signed in to Ubisoft Connect: local client data found and validated.")
+		fmt.Println("Keep the Ubisoft Connect client installed and signed in; the library")
+		fmt.Println("refreshes from its cache on every sync.")
+		fmt.Println("Next: gamelist sync ubisoft")
+
+	case models.StoreXbox, models.StoreDLsite:
 		var ph api.StoreAPI
 		switch store {
-		case models.StoreGOG:
-			ph = api.NewGOGAPI()
-		case models.StoreUbisoft:
-			ph = api.NewUbisoftAPI()
 		case models.StoreXbox:
 			ph = api.NewXboxAPI()
 		case models.StoreDLsite:
@@ -600,8 +669,10 @@ Editable keys:
   database.dataSourceName
   stores.steam.enabled, stores.steam.apiKey, stores.steam.steamId
   stores.epic.enabled, stores.epic.clientId, stores.epic.clientSecret
+  stores.gog.enabled, stores.gog.clientId, stores.gog.clientSecret
+  stores.ubisoft.enabled, stores.ubisoft.dataPath
   stores.battlenet.enabled, stores.battlenet.clientId, stores.battlenet.clientSecret
-  stores.gog.enabled, stores.ubisoft.enabled, stores.xbox.enabled, stores.dlsite.enabled
+  stores.ubisoft.enabled, stores.xbox.enabled, stores.dlsite.enabled
 `)
 }
 
@@ -627,8 +698,14 @@ func configValue(cfg *configs.Config, key string) string {
 		return cfg.Stores.Epic.ClientSecret
 	case "stores.gog.enabled":
 		return strconv.FormatBool(cfg.Stores.Gog.Enabled)
+	case "stores.gog.clientId":
+		return cfg.Stores.Gog.ClientID
+	case "stores.gog.clientSecret":
+		return cfg.Stores.Gog.ClientSecret
 	case "stores.ubisoft.enabled":
 		return strconv.FormatBool(cfg.Stores.Ubisoft.Enabled)
+	case "stores.ubisoft.dataPath":
+		return cfg.Stores.Ubisoft.DataPath
 	case "stores.xbox.enabled":
 		return strconv.FormatBool(cfg.Stores.Xbox.Enabled)
 	case "stores.battlenet.enabled":
@@ -645,7 +722,8 @@ func configValue(cfg *configs.Config, key string) string {
 
 func isSecretKey(key string) bool {
 	switch key {
-	case "igdb.clientSecret", "stores.steam.apiKey", "stores.epic.clientSecret", "stores.battlenet.clientSecret":
+	case "igdb.clientSecret", "stores.steam.apiKey", "stores.epic.clientSecret",
+		"stores.gog.clientSecret", "stores.battlenet.clientSecret":
 		return true
 	}
 	return false
@@ -655,7 +733,7 @@ func isSecretKey(key string) bool {
 // store construction
 // ---------------------------------------------------------------------------
 
-func buildStoreAPIFromConfig(cfg *configs.Config, storeName string) api.StoreAPI {
+func buildStoreAPIFromConfig(cfg *configs.Config, db *database.DB, storeName string) api.StoreAPI {
 	switch storeName {
 	case models.StoreSteam:
 		s := cfg.Stores.Steam
@@ -668,17 +746,19 @@ func buildStoreAPIFromConfig(cfg *configs.Config, storeName string) api.StoreAPI
 		if !s.Enabled {
 			return nil
 		}
-		return api.NewEpicGamesAPI(s.ClientID, s.ClientSecret)
+		return api.NewEpicGamesAPI(s.ClientID, s.ClientSecret, epicHooks(db))
 	case models.StoreGOG:
-		if !cfg.Stores.Gog.Enabled {
+		s := cfg.Stores.Gog
+		if !s.Enabled {
 			return nil
 		}
-		return api.NewGOGAPI()
+		return api.NewGOGAPI(s.ClientID, s.ClientSecret, gogHooks(db))
 	case models.StoreUbisoft:
-		if !cfg.Stores.Ubisoft.Enabled {
+		s := cfg.Stores.Ubisoft
+		if !s.Enabled {
 			return nil
 		}
-		return api.NewUbisoftAPI()
+		return api.NewUbisoftAPI(s.DataPath)
 	case models.StoreXbox:
 		if !cfg.Stores.Xbox.Enabled {
 			return nil
@@ -700,8 +780,87 @@ func buildStoreAPIFromConfig(cfg *configs.Config, storeName string) api.StoreAPI
 	}
 }
 
+// gogHooks wires GOG session persistence to the local database and stdin for
+// the paste-the-redirect-URL step of the authorization-code flow.
+func gogHooks(db *database.DB) *api.GOGTokenHooks {
+	return &api.GOGTokenHooks{
+		Load: func() *api.GOGTokens {
+			cred, err := db.GetStoreCredential(models.StoreGOG)
+			if err != nil || cred == nil || cred.AccessToken == "" {
+				return nil
+			}
+			tok := &api.GOGTokens{
+				AccessToken:  cred.AccessToken,
+				RefreshToken: cred.RefreshToken,
+				ExpiresAt:    time.Unix(cred.ExpiresAt, 0),
+			}
+			if cred.Meta != "" {
+				var meta struct {
+					Username string `json:"username"`
+				}
+				if err := json.Unmarshal([]byte(cred.Meta), &meta); err == nil {
+					tok.Username = meta.Username
+				}
+			}
+			return tok
+		},
+		Save: func(tok api.GOGTokens) {
+			meta, _ := json.Marshal(map[string]string{
+				"username": tok.Username,
+			})
+			if err := db.SaveStoreCredentials(models.StoreGOG, tok.AccessToken, tok.RefreshToken, tok.ExpiresAt.Unix(), string(meta)); err != nil {
+				log.Printf("Warning: could not store GOG session: %v", err)
+			}
+		},
+		ReadInput: func() (string, error) {
+			return stdinReader.ReadString('\n')
+		},
+	}
+}
+
 func storeEnabled(cfg *configs.Config, key string) bool {
-	return buildStoreAPIFromConfig(cfg, key) != nil
+	return buildStoreAPIFromConfig(cfg, nil, key) != nil
+}
+
+// epicHooks wires Epic session persistence to the local database: the
+// launcher access/refresh tokens live in store_credentials.
+func epicHooks(db *database.DB) *api.EpicTokenHooks {
+	if db == nil {
+		return nil
+	}
+	return &api.EpicTokenHooks{
+		Load: func() *api.EpicTokens {
+			cred, err := db.GetStoreCredential(models.StoreEpic)
+			if err != nil || cred == nil || cred.AccessToken == "" {
+				return nil
+			}
+			tok := &api.EpicTokens{
+				AccessToken:  cred.AccessToken,
+				RefreshToken: cred.RefreshToken,
+				ExpiresAt:    time.Unix(cred.ExpiresAt, 0),
+			}
+			if cred.Meta != "" {
+				var meta struct {
+					AccountID   string `json:"account_id"`
+					DisplayName string `json:"display_name"`
+				}
+				if err := json.Unmarshal([]byte(cred.Meta), &meta); err == nil {
+					tok.AccountID = meta.AccountID
+					tok.DisplayName = meta.DisplayName
+				}
+			}
+			return tok
+		},
+		Save: func(tok api.EpicTokens) {
+			meta, _ := json.Marshal(map[string]string{
+				"account_id":   tok.AccountID,
+				"display_name": tok.DisplayName,
+			})
+			if err := db.SaveStoreCredentials(models.StoreEpic, tok.AccessToken, tok.RefreshToken, tok.ExpiresAt.Unix(), string(meta)); err != nil {
+				log.Printf("Warning: could not store Epic session: %v", err)
+			}
+		},
+	}
 }
 
 func igdbStatus(cfg *configs.Config) string {
@@ -779,6 +938,7 @@ Commands:
   sync [store]      Fetch owned games, match IGDB, store locally
                     [--refresh | --incomplete] skip the completion prompt
   list              Print all stored games as JSON
+  multi [--json]    List games owned on more than one store
   search <title>    Search IGDB directly (tests your IGDB credentials)
   status            Show which stores are enabled and signed in
   config            Manage configuration without editing config.yaml

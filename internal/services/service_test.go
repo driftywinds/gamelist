@@ -256,7 +256,7 @@ func TestEnrichAndSaveIncompleteSkipsAlreadyMatched(t *testing.T) {
 			StoreIDs: map[string]string{models.StoreSteam: "12345"}},
 	}
 
-	out, err := svc.EnrichAndSave(games, SyncModeIncomplete, nil)
+	out, err := svc.EnrichAndSave(games, SyncModeIncomplete, nil, nil)
 	if err != nil {
 		t.Fatalf("EnrichAndSave: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestEnrichAndSaveRefreshRestartsEverything(t *testing.T) {
 		{Title: "Doom", OwnedStores: []string{models.StoreSteam},
 			StoreIDs: map[string]string{models.StoreSteam: "620"}},
 	}
-	out, err := svc.EnrichAndSave(games, SyncModeRefresh, nil)
+	out, err := svc.EnrichAndSave(games, SyncModeRefresh, nil, nil)
 	if err != nil {
 		t.Fatalf("EnrichAndSave: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestEnrichAndSaveReportsProgressPerGame(t *testing.T) {
 	progress := func(done, total int, title, result string) {
 		reports = append(reports, fmt.Sprintf("%d/%d:%s", done, total, title))
 	}
-	if _, err := svc.EnrichAndSave(games, SyncModeRefresh, progress); err != nil {
+	if _, err := svc.EnrichAndSave(games, SyncModeRefresh, progress, nil); err != nil {
 		t.Fatalf("EnrichAndSave: %v", err)
 	}
 	if len(reports) != 2 {
@@ -322,6 +322,59 @@ func TestEnrichAndSaveReportsProgressPerGame(t *testing.T) {
 	// Titles are sorted before enrichment, so Game A is processed first.
 	if reports[0] != "1/2:Game A" || reports[1] != "2/2:Game B" {
 		t.Fatalf("reports = %v", reports)
+	}
+}
+
+func TestEnrichAndSavePrunesStaleLinksAndOrphans(t *testing.T) {
+	db := openDB(t)
+	svc := &GameService{db: db} // IGDB not configured
+
+	// A bogus entry from a previous bad sync, plus a legit Steam game.
+	if err := svc.saveGame(&models.Game{Title: "Old Bogus",
+		OwnedStores: []string{models.StoreEpic},
+		StoreIDs:    map[string]string{models.StoreEpic: "bogus-app"}}); err != nil {
+		t.Fatalf("saveGame bogus: %v", err)
+	}
+	if err := svc.saveGame(&models.Game{Title: "Doom",
+		OwnedStores: []string{models.StoreSteam},
+		StoreIDs:    map[string]string{models.StoreSteam: "620"}}); err != nil {
+		t.Fatalf("saveGame doom: %v", err)
+	}
+
+	// New sync: Epic now reports one real game; Doom's store was not fetched,
+	// so its links must be untouched.
+	games := []models.Game{
+		{Title: "The Escapists", OwnedStores: []string{models.StoreEpic},
+			StoreIDs: map[string]string{models.StoreEpic: "Peony"}},
+	}
+	out, err := svc.EnrichAndSave(games, SyncModeRefresh, nil, []string{models.StoreEpic})
+	if err != nil {
+		t.Fatalf("EnrichAndSave: %v", err)
+	}
+
+	// Only the current Epic game remains (Doom's link survives, but Doom was
+	// not fetched this round and cannot be IGDB-enriched here; it stays).
+	titles := map[string]bool{}
+	for _, g := range out {
+		titles[g.Title] = true
+	}
+	if !titles["The Escapists"] || titles["Old Bogus"] {
+		t.Fatalf("unexpected result set: %v", titles)
+	}
+
+	listed, err := svc.ListGamesFromDB()
+	if err != nil {
+		t.Fatalf("ListGamesFromDB: %v", err)
+	}
+	listedTitles := map[string]bool{}
+	for _, g := range listed {
+		listedTitles[g.Title] = true
+	}
+	if listedTitles["Old Bogus"] {
+		t.Fatal("stale bogus game was not pruned from the database")
+	}
+	if !listedTitles["Doom"] {
+		t.Fatal("Doom must survive an Epic-only prune")
 	}
 }
 

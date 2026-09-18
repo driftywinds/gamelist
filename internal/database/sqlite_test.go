@@ -163,6 +163,55 @@ func TestAddGameStoreLinkIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestPruneStoreLinksRemovesStaleLinksAndOrphanedGames(t *testing.T) {
+	db := openTestDB(t)
+
+	ownedID, err := db.UpsertGame(&GameRecord{Title: "Owned Game"})
+	if err != nil {
+		t.Fatalf("upsert owned: %v", err)
+	}
+	bogusID, err := db.UpsertGame(&GameRecord{Title: "Bogus Game"})
+	if err != nil {
+		t.Fatalf("upsert bogus: %v", err)
+	}
+	if err := db.AddGameStoreLink(ownedID, "epic", "peony"); err != nil {
+		t.Fatalf("link epic: %v", err)
+	}
+	if err := db.AddGameStoreLink(ownedID, "steam", "123"); err != nil {
+		t.Fatalf("link steam: %v", err)
+	}
+	if err := db.AddGameStoreLink(bogusID, "epic", "bogus-app"); err != nil {
+		t.Fatalf("link bogus: %v", err)
+	}
+
+	// Fresh fetch says epic now only owns "peony": the bogus link goes, and
+	// "Bogus Game" loses its last link and is deleted. "Owned Game" keeps its
+	// steam link and survives.
+	if err := db.PruneStoreLinks("epic", []string{"peony"}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM games WHERE id = ?`, bogusID).Scan(&n); err != nil {
+		t.Fatalf("count bogus: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("orphaned bogus game still exists (%d rows)", n)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM games WHERE id = ?`, ownedID).Scan(&n); err != nil {
+		t.Fatalf("count owned: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("owned game was wrongly deleted")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM game_stores WHERE game_id = ? AND store_name = 'steam'`, ownedID).Scan(&n); err != nil {
+		t.Fatalf("count steam link: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("steam link was wrongly pruned")
+	}
+}
+
 func TestStoreCredentialRoundTrip(t *testing.T) {
 	db := openTestDB(t)
 
