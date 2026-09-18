@@ -1,0 +1,48 @@
+package configs
+
+import (
+	"fmt"
+	"os"
+
+	"gopkg.in/yaml.v3" // Using yaml.v3 for better struct tagging and support
+)
+
+// Config holds the application configuration.
+type Config struct {
+	Igdb      IgdbConfig      `yaml:"igdb"`
+	Database  DatabaseConfig  `yaml:"database"`
+	// Add configurations for other services like authentication, etc.
+	// Stores     []StoreConfig   `yaml:"stores"`
+}
+
+// IgdbConfig holds the configuration for the IGDB API.
+type IgdbConfig struct {
+	APIKey string `yaml:"apiKey"`
+	// ClientID string `yaml:"clientId"` // IGDB often requires ClientID too
+}
+
+// DatabaseConfig holds the configuration for the database.
+type DatabaseConfig struct {
+	DataSourceName string `yaml:"dataSourceName"` // e.g., "gamelist.db" or "file:mydata.db?cache=shared&mode=rwc"
+}
+
+// LoadConfig loads configuration from a YAML file.
+func LoadConfig(filePath string) (*Config, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %w", filePath, err)
+	}
+
+	var cfg Config
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config file %s: %w", filePath, err)
+	}
+
+	// Set default values or perform validation if necessary
+	if cfg.Database.DataSourceName == "" {
+		cfg.Database.DataSourceName = "gamelist.db" // Default database file name
+	}
+
+	return &cfg, nil
+}
