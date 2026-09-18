@@ -377,3 +377,37 @@ func (db *DB) LogSyncFinish(logID int64, status, message string) error {
 		status, message, logID)
 	return err
 }
+
+// SyncLogEntry mirrors one row of the sync_log table.
+type SyncLogEntry struct {
+	ID         int64
+	StoreName  string
+	Status     string // pending | success | error
+	Message    string
+	StartedAt  string
+	FinishedAt string // empty while pending
+}
+
+// QuerySyncLog returns the most recent sync log entries (newest first).
+func (db *DB) QuerySyncLog(limit int) ([]SyncLogEntry, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.Query(`SELECT id, store_name, status, COALESCE(message,''),
+		started_at, COALESCE(finished_at,'')
+		FROM sync_log ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]SyncLogEntry, 0)
+	for rows.Next() {
+		var e SyncLogEntry
+		if err := rows.Scan(&e.ID, &e.StoreName, &e.Status, &e.Message, &e.StartedAt, &e.FinishedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}

@@ -5,9 +5,13 @@ your game storefronts, pulls every game you own, matches them against
 [IGDB](https://igdb.com) for metadata, and shows when one game is owned on
 multiple stores. All data lives in a single SQLite file on your machine.
 
+It can also run **headless** as a local JSON API server (`gamelist --headless`),
+exposing every CLI action as HTTP endpoints — see [SERVER_USE.md](SERVER_USE.md)
+for the full API documentation if you want to build a frontend on top of it.
+
 ---
 
-## Store support status (honest version)
+## Store support status
 
 | Store            | Status      | Notes                                                                                   |
 |------------------|-------------|-----------------------------------------------------------------------------------------|
@@ -36,6 +40,8 @@ game-list-manager/
 │   │   ├── igdb_auth.go           Twitch OAuth token source (auto-fetch + refresh + caching)
 │   │   ├── epic.go                Epic device-code login + library (entitlements/assets/catalog)
 │   │   └── store_apis.go          StoreAPI interface + Steam / Battle.net / placeholders
+│   ├── server/
+│   │   └── server.go              HTTP JSON API (--headless): every CLI action as an endpoint
 │   ├── database/
 │   │   └── sqlite.go              modernc.org/sqlite (pure Go), versioned migrations, CRUD
 │   ├── models/
@@ -50,6 +56,7 @@ game-list-manager/
 │       └── client_test.go
 ├── migrations/
 │   └── 001_create_tables.sql      Reference schema (applied automatically at startup)
+├── SERVER_USE.md                  Headless JSON API documentation (--headless)
 ├── configs/
 │   ├── config.go                  Typed YAML config
 │   └── config.yaml                Your credentials go here
@@ -201,14 +208,18 @@ committed; everything needed to build and run is in the repo.
 ## Usage
 
 ```
-gamelist [--config <path>] <command> [args]
+gamelist [--config <path>] [--headless] <command> [args]
 
+  --headless        Serve the JSON API instead of running a command
+                    (optional --addr host:port; see SERVER_USE.md)
   signin <store>    Validate and store credentials for a store (reads config.yaml)
   signout <store>   Remove stored credentials
   sync [store]      Fetch owned games (all stores or one), match IGDB, store locally
                     [--refresh | --incomplete] skip the interactive completion prompt
   list              Print all stored games as JSON (sorted by title)
   multi [--json]    List games owned on MORE THAN ONE store (the cross-store view)
+                    Add store names to restrict the view to games owned on all
+                    of them: multi steam epic (keys or display names work)
   search <title>    Search IGDB directly (tests your IGDB credentials)
   status            Show which stores are enabled and signed in
   config            Manage configuration without editing config.yaml

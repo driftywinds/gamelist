@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,12 +20,22 @@ import (
 	"gamelist/internal/api"
 	"gamelist/internal/database"
 	"gamelist/internal/models"
+	"gamelist/internal/server"
 	"gamelist/internal/services"
 )
 
 func main() {
 	args := os.Args[1:]
 	configPath, args := extractConfigFlag(args)
+
+	// --headless serves the JSON API instead of running a CLI command;
+	// --addr only customizes its listen address (default 127.0.0.1:8080).
+	headless, args := extractFlag(args, "--headless")
+	addr := "127.0.0.1:8080"
+	args, addr, addrSet := extractFlagValue(args, "--addr")
+	if addrSet && !headless {
+		log.Fatalf("--addr only makes sense together with --headless")
+	}
 
 	// Resolve the path HERE so the database location and `config set`/`config
 	// signin` writes can rely on it.
@@ -49,6 +64,11 @@ func main() {
 		log.Fatalf("Database error: %v", err)
 	}
 	defer db.Close()
+
+	if headless {
+		runHeadless(configPath, cfg, db, addr)
+		return
+	}
 
 	if len(args) == 0 {
 		printUsage()
@@ -82,6 +102,38 @@ func main() {
 }
 
 // ---------------------------------------------------------------------------
+// headless (JSON API) mode
+// ---------------------------------------------------------------------------
+
+// runHeadless serves the HTTP JSON API (see SERVER_USE.md) until interrupted.
+// Everything a CLI command can do is exposed as an endpoint, driven by the
+// same services; the API is unauthenticated and meant for localhost only.
+func runHeadless(configPath string, cfg *configs.Config, db *database.DB, addr string) {
+	srv := server.New(configPath, cfg, db)
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	}()
+
+	log.Printf("Headless API listening on http://%s - documentation: SERVER_USE.md", addr)
+	log.Printf("The API is unauthenticated; keep it bound to localhost and do not expose it.")
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("HTTP server: %v", err)
+	}
+	log.Printf("Headless API stopped.")
+}
+
+// ---------------------------------------------------------------------------
 // helpers: config location
 // ---------------------------------------------------------------------------
 
@@ -101,6 +153,43 @@ func extractConfigFlag(args []string) (string, []string) {
 		}
 	}
 	return configPath, rest
+}
+
+// extractFlag removes a valueless flag (e.g. --headless) from args and
+// reports whether it was present.
+func extractFlag(args []string, name string) (bool, []string) {
+	var rest []string
+	found := false
+	for _, a := range args {
+		if a == name {
+			found = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return found, rest
+}
+
+// extractFlagValue removes "name <value>" / "name=<value>" from args and
+// returns (value, wasPresent). found=false leaves value unchanged.
+func extractFlagValue(args []string, name string) ([]string, string, bool) {
+	var rest []string
+	value := ""
+	found := false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == name && i+1 < len(args):
+			value = args[i+1]
+			found = true
+			i++
+		case strings.HasPrefix(args[i], name+"="):
+			value = strings.TrimPrefix(args[i], name+"=")
+			found = true
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return rest, value, found
 }
 
 // resolveConfigPath picks the config file: an explicit --config path wins,
@@ -321,15 +410,25 @@ func cmdList(db *database.DB) {
 }
 
 // cmdMulti lists games owned on MORE THAN ONE store - the cross-store view.
+// Optional store arguments restrict the view to games owned on ALL of the
+// listed stores: `multi steam epic` = games owned on Steam and Epic,
+// `multi steam` = Steam games also owned somewhere else.
 func cmdMulti(db *database.DB, args []string) {
 	asJSON := false
+	var storeFilter []string
 	for _, a := range args {
-		switch a {
-		case "--json":
+		if a == "--json" {
 			asJSON = true
-		default:
-			fmt.Printf("Unknown option %q (usage: multi [--json])\n", a)
+			continue
+		}
+		key, ok := canonicalStoreArg(a)
+		if !ok {
+			fmt.Printf("Unknown store %q (usage: multi [--json] [store ...])\n", a)
+			fmt.Println("Stores: " + strings.Join(models.AllStoreKeys(), ", "))
 			os.Exit(1)
+		}
+		if !slices.Contains(storeFilter, key) {
+			storeFilter = append(storeFilter, key)
 		}
 	}
 
@@ -341,7 +440,7 @@ func cmdMulti(db *database.DB, args []string) {
 
 	multi := make([]models.Game, 0)
 	for _, g := range games {
-		if len(g.OwnedStores) > 1 {
+		if len(g.OwnedStores) > 1 && ownedOnAllStores(g, storeFilter) {
 			multi = append(multi, g)
 		}
 	}
@@ -356,13 +455,21 @@ func cmdMulti(db *database.DB, args []string) {
 	}
 
 	if len(multi) == 0 {
-		fmt.Println("No games are owned on multiple stores yet.")
+		if len(storeFilter) > 0 {
+			fmt.Printf("No games owned on multiple stores matching: %s\n", strings.Join(storeFilter, ", "))
+		} else {
+			fmt.Println("No games are owned on multiple stores yet.")
+		}
 		fmt.Println("Ownership merges by game title - make sure every store you own")
 		fmt.Println("games on has been synced: gamelist sync")
 		return
 	}
 
-	fmt.Printf("%d game(s) owned on multiple stores:\n", len(multi))
+	if len(storeFilter) > 0 {
+		fmt.Printf("%d game(s) owned on multiple stores (all of: %s):\n", len(multi), strings.Join(storeFilter, ", "))
+	} else {
+		fmt.Printf("%d game(s) owned on multiple stores:\n", len(multi))
+	}
 	for _, g := range multi {
 		names := make([]string, 0, len(g.OwnedStores))
 		for _, k := range g.OwnedStores {
@@ -370,6 +477,30 @@ func cmdMulti(db *database.DB, args []string) {
 		}
 		fmt.Printf("  - %s  [%s]\n", g.Title, strings.Join(names, ", "))
 	}
+}
+
+// canonicalStoreArg resolves a user-supplied store name to its canonical key,
+// accepting the lowercase key ("steam") or the display name ("Steam",
+// "Epic Games Store", "Battle.net"), case-insensitively.
+func canonicalStoreArg(arg string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(arg))
+	for _, key := range models.AllStoreKeys() {
+		if key == lower || strings.EqualFold(models.DisplayStoreName(key), arg) {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// ownedOnAllStores reports whether the game is owned on every store in the
+// filter; an empty filter accepts everything.
+func ownedOnAllStores(g models.Game, storeFilter []string) bool {
+	for _, key := range storeFilter {
+		if !slices.Contains(g.OwnedStores, key) {
+			return false
+		}
+	}
+	return true
 }
 
 func cmdSearch(cfg *configs.Config, db *database.DB, args []string) {
@@ -930,7 +1061,13 @@ func storeKey(store, field string) string {
 func printUsage() {
 	fmt.Print(`Game List Manager - local multi-store game library
 
-Usage: gamelist [--config <path>] <command> [args]
+Usage: gamelist [--config <path>] [--headless] <command> [args]
+
+Flags:
+  --config <path>   Use this config file (and its directory for the database)
+  --headless        Serve the JSON API instead of running a command
+                    (see SERVER_USE.md; optional --addr host:port, default
+                    127.0.0.1:8080)
 
 Commands:
   signin <store>    Validate and store credentials for a store
@@ -938,7 +1075,10 @@ Commands:
   sync [store]      Fetch owned games, match IGDB, store locally
                     [--refresh | --incomplete] skip the completion prompt
   list              Print all stored games as JSON
-  multi [--json]    List games owned on more than one store
+  multi [--json] [store ...]
+                    List games owned on more than one store; store names
+                    (e.g. "multi steam epic") restrict it to games owned on
+                    all of the listed stores
   search <title>    Search IGDB directly (tests your IGDB credentials)
   status            Show which stores are enabled and signed in
   config            Manage configuration without editing config.yaml
