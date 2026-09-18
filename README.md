@@ -85,7 +85,7 @@ Key architectural rules:
 - **Go** ≥ 1.22 (only for building from source; no C compiler needed — the SQLite
   driver is pure Go).
 
-### 2. Configure IGDB (you have these already)
+### 2. Configure IGDB
 
 IGDB is **free for non-commercial use but not key-less**: it authenticates through
 Twitch. You need a **Client ID** and **Client Secret**; the app mints and refreshes the
